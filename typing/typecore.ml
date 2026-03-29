@@ -4158,6 +4158,50 @@ let check_let_univars env pat_list exp_list =
     pat_list
     exp_list
 
+(* [%seal expr]: walk the inferred type and close every open object row
+   by unifying its row variable with Tnil. *)
+let seal_object_rows env ty =
+  let visited = ref TypeSet.empty in
+  let rec walk ty =
+    if TypeSet.mem ty !visited then ()
+    else begin
+      visited := TypeSet.add ty !visited;
+      match get_desc ty with
+      | Tobject (fields, _) ->
+          close_row fields;
+          walk_fields fields
+      | Tarrow (_, ty1, ty2, _) ->
+          walk ty1;
+          walk ty2
+      | Ttuple tys ->
+          List.iter (fun (_, ty) -> walk ty) tys
+      | Tconstr (_, args, _) ->
+          List.iter walk args
+      | Tpoly (ty, _) ->
+          walk ty
+      | Tpackage { pack_constraints; _ } ->
+          List.iter (fun (_, ty) -> walk ty) pack_constraints
+      | Tvar _ | Tunivar _ | Tnil | Tlink _ | Tsubst _ | Tvariant _
+      | Tfield _ | Tfunctor _ ->
+          ()
+    end
+  and walk_fields ty =
+    match get_desc ty with
+    | Tfield (_, _, ty_arg, ty_rest) ->
+        walk ty_arg;
+        walk_fields ty_rest
+    | _ -> ()
+  and close_row fields =
+    match get_desc fields with
+    | Tfield (_, _, _, rest) -> close_row rest
+    | Tvar _ ->
+        (* open row variable — close it *)
+        unify env fields (newty Tnil)
+    | Tnil -> ()
+    | _ -> ()
+  in
+  walk ty
+
 let rec type_exp ?recarg env sexp =
   (* We now delegate everything to type_expect *)
   type_expect ?recarg env sexp (mk_expected (newvar ()))
@@ -5211,6 +5255,22 @@ and type_expect_
             exp_env = env;
             exp_attributes = sexp.pexp_attributes; }
 
+  | Pexp_extension ({ txt = ("seal" | "ocaml.seal"); _ },
+                    payload) ->
+      begin match payload with
+      | PStr [ { pstr_desc = Pstr_eval (sarg, _) } ] ->
+          let exp = type_exp env sarg in
+          seal_object_rows env exp.exp_type;
+          rue { exp with
+                exp_loc = loc;
+                exp_extra = [];
+                exp_attributes = sexp.pexp_attributes;
+                exp_env = env }
+      | _ ->
+          raise (Error_forward
+            (Builtin_attributes.error_of_extension
+              ({Location.txt = "seal"; loc}, payload)))
+      end
   | Pexp_extension ({ txt = ("ocaml.extension_constructor"
                              |"extension_constructor"); _ },
                     payload) ->
